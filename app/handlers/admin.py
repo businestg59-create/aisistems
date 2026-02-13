@@ -17,7 +17,9 @@ def build_admin_router(db: Database) -> Router:
     async def on_private_message(message: Message) -> None:
         try:
             await db.set_admin_chat_id(message.chat.id)
-            await message.answer("✅ Админ-чат подключен")
+            await message.answer(
+                "✅ Админ-чат подключен. Теперь все уведомления о клиентах, негативе и запросах на человека будут приходить сюда."
+            )
         except Exception:
             logger.exception("Failed to register admin chat")
 
