@@ -34,6 +34,24 @@ STEP_DONE = 7
 MAX_USER_QUESTION_LEN = 2000
 TEXT_NON_MESSAGE = "<не текстовое сообщение>"
 
+
+def _is_greeting_only(text: str) -> bool:
+    low = (text or "").strip().lower()
+    if not low or low == TEXT_NON_MESSAGE:
+        return True
+    greetings = ("привет", "здравствуйте", "добрый", "hi", "hello", "hey")
+    # если просто приветствие без сути
+    return any(low == g or low.startswith(g + " ") for g in greetings) and len(low) <= 20
+
+
+def _admin_contact_link(username: str | None, chat_id: int) -> str:
+    # если есть username — лучший вариант
+    if username:
+        return f"https://t.me/{username}"
+    # иначе пробуем deep link (часто кликается в Telegram Desktop/Mobile)
+    return f"tg://user?id={chat_id}"
+
+
 ALLOWED_NEED = {"бот", "сайт", "автоматизация", "другое"}
 ALLOWED_BUDGET = {"до 30k", "30–80k", "80–150k", "150k+"}
 ALLOWED_DEADLINE = {"срочно 1–3 дня", "1–2 недели", "в течение месяца", "не горит"}
@@ -84,15 +102,9 @@ def build_business_router(db: Database, config: Config) -> Router:
         try:
             await db.upsert_connection(
                 business_connection_id=event.id,
-                owner_user_id=event.user.id,
+                owner_user_id=event.user.id if event.user else None,
                 owner_user_chat_id=event.user_chat_id,
-                can_reply=event.can_reply,
-            )
-            logger.info(
-                "Business connection updated: id=%s can_reply=%s user_chat_id=%s",
-                event.id,
-                event.can_reply,
-                event.user_chat_id,
+                can_reply=bool(event.can_reply),
             )
             if event.user_chat_id:
                 await db.set_admin_chat_id(event.user_chat_id)
@@ -145,6 +157,9 @@ def build_business_router(db: Database, config: Config) -> Router:
                     config=config,
                     business_connection_id=bcid,
                     client_chat_id=client_chat_id,
+                    username=username,
+                    full_name=full_name,
+                    text=question,
                 )
                 return
 
@@ -169,58 +184,45 @@ def build_business_router(db: Database, config: Config) -> Router:
                     username=username,
                     text=question,
                     lead=lead,
-                    reason="Запрос кнопкой 'Позвать менеджера'",
+                    reason="Запрос на человека (кнопка)",
                     urgency="high",
                     need_human=True,
                     negative=False,
                 )
                 return
 
-            risk = _rule_based_risk(question)
-            if risk is None:
-                risk = await classify_risk(config, question)
+            rule_risk = _rule_based_risk(question)
+            if rule_risk is None and config.openai_api_key:
+                try:
+                    rule_risk = await classify_risk(config=config, user_text=question)
+                except Exception:
+                    logger.exception("Risk classification failed, fallback to rule-based only")
 
-            if _should_critical_escalate(risk):
-                await _escalate_to_human(
+            if rule_risk:
+                if _should_critical_escalate(rule_risk):
+                    await _escalate_to_human(
+                        bot=bot,
+                        db=db,
+                        config=config,
+                        business_connection_id=bcid,
+                        client_chat_id=client_chat_id,
+                        full_name=full_name,
+                        username=username,
+                        text=question,
+                        lead=lead,
+                        reason=str(rule_risk.get("reason") or "Эскалация по сообщению клиента"),
+                        urgency=str(rule_risk.get("urgency") or "high"),
+                        need_human=bool(rule_risk.get("need_human")),
+                        negative=bool(rule_risk.get("negative")),
+                    )
+                    return
+
+            if lead.step > STEP_WELCOME:
+                await _handle_lead_flow(
                     bot=bot,
                     db=db,
                     config=config,
-                    business_connection_id=bcid,
-                    client_chat_id=client_chat_id,
-                    full_name=full_name,
-                    username=username,
-                    text=question,
-                    lead=lead,
-                    reason=str(risk.get("reason", "")),
-                    urgency=str(risk.get("urgency", "high")),
-                    need_human=bool(risk.get("need_human", False)),
-                    negative=bool(risk.get("negative", False)),
-                )
-                return
-
-            if bool(risk.get("negative")) and str(risk.get("urgency")) == "medium":
-                await _send_business_message(
-                    bot,
-                    bcid,
-                    client_chat_id,
-                    (
-                        "Понимаю ваше недовольство и извиняюсь за неудобства. "
-                        "Постараюсь решить вопрос максимально быстро. "
-                        "Если хотите, могу сразу подключить менеджера."
-                    ),
-                    reply_markup=need_keyboard(),
-                )
-
-            if lead.step == STEP_DONE:
-                await db.create_or_reset_lead(bcid, client_chat_id)
-                lead = await db.get_lead(bcid, client_chat_id)
-                assert lead is not None
-
-            if 0 < lead.step < STEP_DONE:
-                await _handle_lead_dialog(
-                    bot=bot,
-                    db=db,
-                    config=config,
+                    rag_store=rag_store,
                     business_connection_id=bcid,
                     client_chat_id=client_chat_id,
                     client_text=question,
@@ -337,10 +339,12 @@ async def _escalate_to_human(
 
     username_text = f"@{username}" if username else "нет username"
     lead_state = _lead_state_text(lead)
+    link = _admin_contact_link(username, client_chat_id)
     alert_text = (
         "🚨 КРИТИЧНО: клиент просит человека/негатив\n"
         f"Клиент: {full_name or 'без имени'} ({username_text})\n"
         f"chat_id: {client_chat_id}\n"
+        f"Ссылка: {link}\n"
         f"business_connection_id: {business_connection_id}\n"
         f"need_human={need_human}, negative={negative}, urgency={urgency}\n"
         f"Причина: {reason or '-'}\n"
@@ -350,77 +354,161 @@ async def _escalate_to_human(
     await bot.send_message(chat_id=admin_chat_id, text=alert_text)
 
 
-def _lead_state_text(lead: LeadInfo | None) -> str:
-    if lead is None:
-        return "step=0, need=-, budget=-, timeline=-, contact=-"
-    return (
-        f"step={lead.step}, "
-        f"need={lead.need or '-'}, "
-        f"budget={lead.budget or '-'}, "
-        f"timeline={lead.deadline or '-'}, "
-        f"contact={lead.contact_method or '-'}"
-    )
-
-
-async def _ensure_connection_info(bot: Bot, db: Database, business_connection_id: str) -> None:
-    existing = await db.get_connection(business_connection_id)
-    if existing:
-        return
-
-    try:
-        fetched = await bot.get_business_connection(business_connection_id=business_connection_id)
-    except Exception:
-        logger.warning("Could not fetch business connection via API: id=%s", business_connection_id)
-        return
-
-    await db.upsert_connection(
-        business_connection_id=fetched.id,
-        owner_user_id=fetched.user.id,
-        owner_user_chat_id=fetched.user_chat_id,
-        can_reply=fetched.can_reply,
-    )
-
-
-async def _notify_new_client(
+async def _handle_lead_flow(
     bot: Bot,
     db: Database,
     config: Config,
+    rag_store: RAGStore,
     business_connection_id: str,
     client_chat_id: int,
-    username: str | None,
-    full_name: str | None,
-    text: str,
+    client_text: str,
+    lead: LeadInfo,
 ) -> None:
-    admin_chat_id = await db.resolve_admin_chat_id(business_connection_id, config.admin_chat_id)
-    if not admin_chat_id:
-        logger.warning("Cannot notify new client: admin chat id is unknown")
+    text = (client_text or "").strip()
+    step = lead.step
+
+    if step == STEP_NEED:
+        value = _normalize_need(text)
+        if value not in ALLOWED_NEED:
+            await _send_business_message(
+                bot,
+                business_connection_id,
+                client_chat_id,
+                "Подскажите, что вас интересует: бот / сайт / автоматизация / другое?",
+                reply_markup=need_keyboard(),
+            )
+            return
+        await db.update_lead_fields(business_connection_id, client_chat_id, need=value, step=STEP_BUDGET)
+        await _send_business_message(
+            bot,
+            business_connection_id,
+            client_chat_id,
+            "Отлично. Скажите, пожалуйста, какой бюджет комфортен?",
+            reply_markup=budget_keyboard(),
+        )
         return
 
-    display_name = full_name or "без имени"
-    if username:
-        display_name = f"{display_name} (@{username})"
-
-    notify_text = f"🆕 Новый клиент: {display_name} | chat_id={client_chat_id} | текст={text}"
-    await bot.send_message(chat_id=admin_chat_id, text=notify_text)
-
-
-async def _notify_cannot_reply(
-    bot: Bot,
-    db: Database,
-    config: Config,
-    business_connection_id: str,
-    client_chat_id: int,
-) -> None:
-    admin_chat_id = await db.resolve_admin_chat_id(business_connection_id, config.admin_chat_id)
-    if not admin_chat_id:
-        logger.warning("Cannot send can_reply warning: admin chat id is unknown")
+    if step == STEP_BUDGET:
+        value = _normalize_budget(text)
+        if value not in ALLOWED_BUDGET:
+            await _send_business_message(
+                bot,
+                business_connection_id,
+                client_chat_id,
+                "Выберите бюджет из вариантов ниже 🙂",
+                reply_markup=budget_keyboard(),
+            )
+            return
+        await db.update_lead_fields(business_connection_id, client_chat_id, budget=value, step=STEP_DEADLINE)
+        await _send_business_message(
+            bot,
+            business_connection_id,
+            client_chat_id,
+            "Понял. По срокам как удобно?",
+            reply_markup=deadline_keyboard(),
+        )
         return
 
-    text = (
-        "⚠️ Нет права отвечать клиенту через Business API. "
-        f"business_connection_id={business_connection_id}, chat_id={client_chat_id}"
+    if step == STEP_DEADLINE:
+        value = _normalize_deadline(text)
+        if value not in ALLOWED_DEADLINE:
+            await _send_business_message(
+                bot,
+                business_connection_id,
+                client_chat_id,
+                "Выберите срок из вариантов ниже 🙂",
+                reply_markup=deadline_keyboard(),
+            )
+            return
+        await db.update_lead_fields(business_connection_id, client_chat_id, deadline=value, step=STEP_CONTACT_METHOD)
+        await _send_business_message(
+            bot,
+            business_connection_id,
+            client_chat_id,
+            "Как удобнее связаться для уточнения деталей?",
+            reply_markup=contact_keyboard(),
+        )
+        return
+
+    if step == STEP_CONTACT_METHOD:
+        value = _normalize_contact(text)
+        if value not in ALLOWED_CONTACT:
+            await _send_business_message(
+                bot,
+                business_connection_id,
+                client_chat_id,
+                "Выберите вариант связи 🙂",
+                reply_markup=contact_keyboard(),
+            )
+            return
+
+        await db.update_lead_fields(business_connection_id, client_chat_id, contact_method=value)
+        if value == "по телефону":
+            await db.update_lead_fields(business_connection_id, client_chat_id, step=STEP_PHONE)
+            await _send_business_message(
+                bot,
+                business_connection_id,
+                client_chat_id,
+                "Ок. Напишите, пожалуйста, номер телефона (в любом формате).",
+                reply_markup=remove_keyboard(),
+            )
+            return
+
+        if value == "созвон":
+            await db.update_lead_fields(business_connection_id, client_chat_id, step=STEP_CALL_TIME)
+            await _send_business_message(
+                bot,
+                business_connection_id,
+                client_chat_id,
+                "Отлично. Напишите, пожалуйста, удобное время для созвона (например: сегодня после 18:00).",
+                reply_markup=remove_keyboard(),
+            )
+            return
+
+        await db.update_lead_fields(business_connection_id, client_chat_id, step=STEP_DONE)
+        await _finalize_lead(bot, db, config, business_connection_id, client_chat_id)
+        return
+
+    if step == STEP_PHONE:
+        phone = _extract_phone(text)
+        if not phone:
+            await _send_business_message(
+                bot,
+                business_connection_id,
+                client_chat_id,
+                "Не вижу номер. Пришлите, пожалуйста, телефон ещё раз 🙂",
+                reply_markup=remove_keyboard(),
+            )
+            return
+        await db.update_lead_fields(business_connection_id, client_chat_id, phone=phone, step=STEP_DONE)
+        await _finalize_lead(bot, db, config, business_connection_id, client_chat_id)
+        return
+
+    if step == STEP_CALL_TIME:
+        call_time = text[:200] if text else None
+        if not call_time:
+            await _send_business_message(
+                bot,
+                business_connection_id,
+                client_chat_id,
+                "Подскажите, пожалуйста, удобное время для созвона 🙂",
+                reply_markup=remove_keyboard(),
+            )
+            return
+        await db.update_lead_fields(business_connection_id, client_chat_id, call_time=call_time, step=STEP_DONE)
+        await _finalize_lead(bot, db, config, business_connection_id, client_chat_id)
+        return
+
+    await _handle_rag_entry(
+        bot=bot,
+        db=db,
+        config=config,
+        rag_store=rag_store,
+        business_connection_id=business_connection_id,
+        client_chat_id=client_chat_id,
+        client_text=client_text,
+        lead=lead,
     )
-    await bot.send_message(chat_id=admin_chat_id, text=text)
 
 
 async def _handle_rag_entry(
@@ -434,15 +522,43 @@ async def _handle_rag_entry(
     lead: LeadInfo,
 ) -> None:
     question = client_text[:MAX_USER_QUESTION_LEN]
-    retrieved = await rag_store.search(question, 6)
-    if not retrieved:
+    is_first_touch = (lead.step == STEP_WELCOME)
+
+    # Если это первое касание и клиент написал просто "привет" — не тратим RAG, а просим сформулировать вопрос
+    if is_first_touch and _is_greeting_only(question):
         await _send_business_message(
             bot,
             business_connection_id,
             client_chat_id,
             (
-                "Извините, не совсем понимаю, о чем речь. "
-                "Уточните, пожалуйста, что именно вы хотите: бот / сайт / автоматизация / другое?"
+                "Привет! 👋 Я AI-консультант AI-Системы.\n"
+                "Подскажите, пожалуйста, какой у вас вопрос? Можно в 1–2 предложениях 🙂"
+            ),
+            reply_markup=need_keyboard(),
+        )
+        await db.update_lead_fields(
+            business_connection_id,
+            client_chat_id,
+            step=STEP_NEED,
+            last_client_message=question,
+            rag_sources=[],
+        )
+        return
+
+    retrieved = await rag_store.search(question, 6)
+    if not retrieved:
+        hello = ""
+        if is_first_touch:
+            hello = "Привет! 👋 Я AI-консультант AI-Системы.\n\n"
+
+        await _send_business_message(
+            bot,
+            business_connection_id,
+            client_chat_id,
+            (
+                hello
+                + "Извините, не совсем понимаю, о чем речь. "
+                + "Уточните, пожалуйста, что именно вы хотите: бот / сайт / автоматизация / другое?"
             ),
             reply_markup=need_keyboard(),
         )
@@ -462,6 +578,15 @@ async def _handle_rag_entry(
         lead_context={"step": lead.step},
     )
     source_urls = _unique_urls([item.source_url for item in retrieved])
+
+    if is_first_touch:
+        answer = (
+            "Привет! 👋 Я AI-консультант AI-Системы.\n"
+            "Спасибо за сообщение — сейчас подскажу.\n\n"
+            + answer
+            + "\n\nЧтобы точнее сориентировать по срокам и бюджету: что вам нужно — бот / сайт / автоматизация / другое?"
+        )
+
     await _send_business_message(
         bot=bot,
         business_connection_id=business_connection_id,
@@ -477,355 +602,6 @@ async def _handle_rag_entry(
         rag_sources=source_urls,
     )
 
-    extracted = await extract_lead_fields(config, question)
-    await _apply_extracted_fields(db, business_connection_id, client_chat_id, extracted)
-    updated = await db.get_lead(business_connection_id, client_chat_id)
-    if updated:
-        await _advance_or_ask_next(bot, db, config, updated)
-
-
-async def _handle_lead_dialog(
-    bot: Bot,
-    db: Database,
-    config: Config,
-    business_connection_id: str,
-    client_chat_id: int,
-    client_text: str,
-    lead: LeadInfo,
-) -> None:
-    await db.update_lead_fields(
-        business_connection_id,
-        client_chat_id,
-        last_client_message=client_text,
-    )
-
-    if lead.step == STEP_NEED:
-        need = _normalize_need(client_text)
-        if need:
-            await db.update_lead_fields(business_connection_id, client_chat_id, need=need)
-    elif lead.step == STEP_BUDGET:
-        budget = _normalize_budget(client_text)
-        if budget:
-            await db.update_lead_fields(business_connection_id, client_chat_id, budget=budget)
-    elif lead.step == STEP_DEADLINE:
-        deadline = _normalize_deadline(client_text)
-        if deadline:
-            await db.update_lead_fields(business_connection_id, client_chat_id, deadline=deadline)
-    elif lead.step == STEP_CONTACT_METHOD:
-        contact = _normalize_contact(client_text)
-        if contact:
-            await db.update_lead_fields(business_connection_id, client_chat_id, contact_method=contact)
-    elif lead.step == STEP_PHONE:
-        phone = _extract_phone(client_text)
-        if phone:
-            await db.update_lead_fields(business_connection_id, client_chat_id, phone=phone)
-    elif lead.step == STEP_CALL_TIME:
-        await db.update_lead_fields(business_connection_id, client_chat_id, call_time=client_text)
-
-    extracted = await extract_lead_fields(config, client_text)
-    await _apply_extracted_fields(db, business_connection_id, client_chat_id, extracted)
-    updated = await db.get_lead(business_connection_id, client_chat_id)
-    if not updated:
-        return
-
-    await _advance_or_ask_next(bot, db, config, updated)
-
-
-async def _apply_extracted_fields(
-    db: Database,
-    business_connection_id: str,
-    client_chat_id: int,
-    extracted: dict[str, str | None],
-) -> None:
-    lead = await db.get_lead(business_connection_id, client_chat_id)
-    if not lead:
-        return
-
-    updates: dict[str, str] = {}
-    if not lead.need and extracted.get("need"):
-        need = _normalize_need(extracted["need"] or "")
-        if need:
-            updates["need"] = need
-    if not lead.budget and extracted.get("budget"):
-        budget = _normalize_budget(extracted["budget"] or "")
-        if budget:
-            updates["budget"] = budget
-    if not lead.deadline and extracted.get("timeline"):
-        deadline = _normalize_deadline(extracted["timeline"] or "")
-        if deadline:
-            updates["deadline"] = deadline
-    if not lead.contact_method and extracted.get("contact_method"):
-        contact = _normalize_contact(extracted["contact_method"] or "")
-        if contact:
-            updates["contact_method"] = contact
-    if not lead.phone and extracted.get("phone"):
-        phone = _extract_phone(extracted["phone"] or "")
-        if phone:
-            updates["phone"] = phone
-
-    if updates:
-        await db.update_lead_fields(
-            business_connection_id,
-            client_chat_id,
-            need=updates.get("need"),
-            budget=updates.get("budget"),
-            deadline=updates.get("deadline"),
-            contact_method=updates.get("contact_method"),
-            phone=updates.get("phone"),
-        )
-
-
-def _next_step(lead: LeadInfo) -> int:
-    if not lead.need:
-        return STEP_NEED
-    if not lead.budget:
-        return STEP_BUDGET
-    if not lead.deadline:
-        return STEP_DEADLINE
-    if not lead.contact_method:
-        return STEP_CONTACT_METHOD
-    if lead.contact_method == "по телефону" and not lead.phone:
-        return STEP_PHONE
-    if lead.contact_method == "созвон" and not lead.call_time:
-        return STEP_CALL_TIME
-    return STEP_DONE
-
-
-async def _advance_or_ask_next(
-    bot: Bot,
-    db: Database,
-    config: Config,
-    lead: LeadInfo,
-) -> None:
-    next_step = _next_step(lead)
-    if next_step == STEP_DONE:
-        await db.update_lead_fields(lead.business_connection_id, lead.client_chat_id, step=STEP_DONE)
-        await _finalize_lead(bot, db, config, lead.business_connection_id, lead.client_chat_id)
-        return
-
-    await db.update_lead_fields(lead.business_connection_id, lead.client_chat_id, step=next_step)
-    if next_step == STEP_NEED:
-        intent = await classify_intent(config, lead.last_client_message or "")
-        if intent.get("intent") in {"bot", "site", "automation", "other"}:
-            await db.update_lead_fields(
-                lead.business_connection_id,
-                lead.client_chat_id,
-                need=_intent_to_need(str(intent["intent"])),
-                step=STEP_BUDGET,
-            )
-            await _send_business_message(
-                bot,
-                lead.business_connection_id,
-                lead.client_chat_id,
-                "Какой у вас ориентировочный бюджет?",
-                reply_markup=budget_keyboard(),
-            )
-            return
-        await _send_business_message(
-            bot,
-            lead.business_connection_id,
-            lead.client_chat_id,
-            "Что хотите сделать? (бот / сайт / автоматизация / другое)",
-            reply_markup=need_keyboard(),
-        )
-        return
-    if next_step == STEP_BUDGET:
-        await _send_business_message(
-            bot,
-            lead.business_connection_id,
-            lead.client_chat_id,
-            "Какой у вас ориентировочный бюджет?",
-            reply_markup=budget_keyboard(),
-        )
-        return
-    if next_step == STEP_DEADLINE:
-        await _send_business_message(
-            bot,
-            lead.business_connection_id,
-            lead.client_chat_id,
-            "Какие сроки реализации?",
-            reply_markup=deadline_keyboard(),
-        )
-        return
-    if next_step == STEP_CONTACT_METHOD:
-        await _send_business_message(
-            bot,
-            lead.business_connection_id,
-            lead.client_chat_id,
-            "Как вам удобно связаться?",
-            reply_markup=contact_keyboard(),
-        )
-        return
-    if next_step == STEP_PHONE:
-        await _send_business_message(
-            bot,
-            lead.business_connection_id,
-            lead.client_chat_id,
-            "Напишите, пожалуйста, номер телефона текстом.",
-            reply_markup=remove_keyboard(),
-        )
-        return
-    if next_step == STEP_CALL_TIME:
-        await _send_business_message(
-            bot,
-            lead.business_connection_id,
-            lead.client_chat_id,
-            "Напишите удобное время для созвона.",
-            reply_markup=remove_keyboard(),
-        )
-
-
-async def _finalize_lead(
-    bot: Bot,
-    db: Database,
-    config: Config,
-    business_connection_id: str,
-    client_chat_id: int,
-) -> None:
-    lead = await db.get_lead(business_connection_id, client_chat_id)
-    if lead is None:
-        logger.warning("Cannot finalize lead: lead not found")
-        return
-
-    sources: list[str] = []
-    if lead.rag_sources_json:
-        try:
-            loaded = json.loads(lead.rag_sources_json)
-            if isinstance(loaded, list):
-                sources = [str(x) for x in loaded if str(x).strip()]
-        except json.JSONDecodeError:
-            sources = []
-
-    summary_data = {
-        "business_connection_id": business_connection_id,
-        "client_chat_id": client_chat_id,
-        "need": lead.need,
-        "budget": lead.budget,
-        "timeline": lead.deadline,
-        "contact_method": lead.contact_method,
-        "phone": lead.phone,
-        "call_time": lead.call_time,
-        "last_client_message": lead.last_client_message,
-        "sources": sources,
-    }
-    await db.update_lead_fields(
-        business_connection_id,
-        client_chat_id,
-        summary=summary_data,
-    )
-
-    admin_chat_id = await db.resolve_admin_chat_id(business_connection_id, config.admin_chat_id)
-    if admin_chat_id:
-        hot = _is_hot_lead(lead)
-        lines = [
-            "📌 Новый лид",
-            f"Клиент chat_id: {client_chat_id}",
-            f"Потребность: {lead.need or '-'}",
-            f"Бюджет: {lead.budget or '-'}",
-            f"Срок: {lead.deadline or '-'}",
-            f"Контакт: {lead.contact_method or '-'}",
-            f"Телефон: {lead.phone or '-'}",
-            f"Последний вопрос: {lead.last_client_message or '-'}",
-        ]
-        for url in sources[:5]:
-            lines.append(f"Источник: {url}")
-        if hot:
-            lines.append("🔥 горячий лид")
-        await bot.send_message(chat_id=admin_chat_id, text="\n".join(lines))
-    else:
-        logger.warning("Cannot send lead summary: admin chat id is unknown")
-
-    await db.close_escalation(business_connection_id, client_chat_id)
-    await _send_business_message(
-        bot,
-        business_connection_id,
-        client_chat_id,
-        "Спасибо! Я передал менеджеру, скоро свяжемся.",
-        reply_markup=remove_keyboard(),
-    )
-
-
-def _is_hot_lead(lead: LeadInfo) -> bool:
-    if lead.urgency == "high":
-        return True
-    budget = (lead.budget or "").lower()
-    return "80" in budget or "150" in budget
-
-
-def _normalize_need(value: str) -> str | None:
-    low = value.lower().strip()
-    if "бот" in low:
-        return "бот"
-    if "сайт" in low:
-        return "сайт"
-    if "автомат" in low:
-        return "автоматизация"
-    if "друго" in low:
-        return "другое"
-    return low if low in ALLOWED_NEED else None
-
-
-def _normalize_budget(value: str) -> str | None:
-    low = value.lower().replace(" ", "")
-    if "30" in low and ("до" in low or "<" in low):
-        return "до 30k"
-    if "30" in low and "80" in low:
-        return "30–80k"
-    if "80" in low and "150" in low:
-        return "80–150k"
-    if "150" in low or "+" in low:
-        return "150k+"
-    return value if value in ALLOWED_BUDGET else None
-
-
-def _normalize_deadline(value: str) -> str | None:
-    low = value.lower()
-    if "сроч" in low or "1-3" in low or "1–3" in low:
-        return "срочно 1–3 дня"
-    if "1-2" in low or "1–2" in low or "недел" in low:
-        return "1–2 недели"
-    if "месяц" in low:
-        return "в течение месяца"
-    if "не гор" in low:
-        return "не горит"
-    return value if value in ALLOWED_DEADLINE else None
-
-
-def _normalize_contact(value: str) -> str | None:
-    low = value.lower()
-    if "telegram" in low:
-        return "в Telegram"
-    if "телефон" in low or "звон" in low:
-        return "по телефону"
-    if "созвон" in low:
-        return "созвон"
-    return value if value in ALLOWED_CONTACT else None
-
-
-def _extract_phone(value: str) -> str | None:
-    match = re.search(r"(\+?\d[\d\-\s\(\)]{8,}\d)", value)
-    return match.group(1).strip() if match else None
-
-
-def _intent_to_need(intent: str) -> str:
-    return {
-        "bot": "бот",
-        "site": "сайт",
-        "automation": "автоматизация",
-        "other": "другое",
-    }.get(intent, "другое")
-
-
-def _unique_urls(urls: list[str]) -> list[str]:
-    seen: set[str] = set()
-    result: list[str] = []
-    for url in urls:
-        clean = url.strip()
-        if clean and clean not in seen:
-            seen.add(clean)
-            result.append(clean)
-    return result
-
 
 async def _send_business_message(
     bot: Bot,
@@ -837,6 +613,197 @@ async def _send_business_message(
     await bot.send_message(
         chat_id=chat_id,
         text=text,
-        business_connection_id=business_connection_id,
         reply_markup=reply_markup,
+        business_connection_id=business_connection_id,
     )
+
+
+async def _ensure_connection_info(bot: Bot, db: Database, business_connection_id: str) -> None:
+    existing = await db.get_connection(business_connection_id)
+    if existing and existing.owner_user_id:
+        return
+
+    try:
+        info = await bot.get_business_connection(business_connection_id)
+        await db.upsert_connection(
+            business_connection_id=info.id,
+            owner_user_id=info.user.id if info.user else None,
+            owner_user_chat_id=info.user_chat_id,
+            can_reply=bool(info.can_reply),
+        )
+        if info.user_chat_id:
+            await db.set_admin_chat_id(info.user_chat_id)
+    except Exception:
+        logger.exception("Failed to fetch business_connection info bcid=%s", business_connection_id)
+
+
+async def _notify_new_client(
+    bot: Bot,
+    db: Database,
+    config: Config,
+    business_connection_id: str,
+    client_chat_id: int,
+    username: str | None,
+    full_name: str | None,
+    text: str,
+) -> None:
+    admin_chat_id = await db.resolve_admin_chat_id(business_connection_id, config.admin_chat_id)
+    if not admin_chat_id:
+        logger.warning("Cannot notify new client: admin chat id is unknown")
+        return
+
+    username_text = f"@{username}" if username else "нет username"
+    link = _admin_contact_link(username, client_chat_id)
+
+    notify_text = (
+        "🆕 НОВЫЙ КЛИЕНТ\n"
+        f"Клиент: {full_name or 'без имени'} ({username_text})\n"
+        f"chat_id: {client_chat_id}\n"
+        f"Сообщение: {text[:1200]}\n"
+        f"Ссылка: {link}\n"
+        f"bcid: {business_connection_id}"
+    )
+    await bot.send_message(chat_id=admin_chat_id, text=notify_text)
+
+
+async def _notify_cannot_reply(
+    bot: Bot,
+    db: Database,
+    config: Config,
+    business_connection_id: str,
+    client_chat_id: int,
+    username: str | None,
+    full_name: str | None,
+    text: str,
+) -> None:
+    admin_chat_id = await db.resolve_admin_chat_id(business_connection_id, config.admin_chat_id)
+    if not admin_chat_id:
+        logger.warning("Cannot send can_reply warning: admin chat id is unknown")
+        return
+
+    username_text = f"@{username}" if username else "нет username"
+    link = _admin_contact_link(username, client_chat_id)
+
+    msg = (
+        "⚠️ НЕТ ПРАВА ОТВЕЧАТЬ через Business API (can_reply=false)\n"
+        f"Клиент: {full_name or 'без имени'} ({username_text})\n"
+        f"chat_id: {client_chat_id}\n"
+        f"bcid: {business_connection_id}\n"
+        f"Сообщение: {text[:1200]}\n"
+        f"Ссылка: {link}\n\n"
+        "👉 Проверь в Telegram Business права бота (Reply/Manage messages)."
+    )
+    await bot.send_message(chat_id=admin_chat_id, text=msg)
+
+
+def _unique_urls(urls: list[str | None]) -> list[str]:
+    out: list[str] = []
+    seen = set()
+    for u in urls:
+        if not u:
+            continue
+        if u in seen:
+            continue
+        seen.add(u)
+        out.append(u)
+    return out
+
+
+def _normalize_need(text: str) -> str:
+    t = (text or "").strip().lower()
+    if "бот" in t:
+        return "бот"
+    if "сайт" in t:
+        return "сайт"
+    if "авто" in t:
+        return "автоматизация"
+    return "другое"
+
+
+def _normalize_budget(text: str) -> str:
+    t = (text or "").strip().lower()
+    if "до" in t or "30" in t and "80" not in t:
+        return "до 30k"
+    if "30" in t and "80" in t:
+        return "30–80k"
+    if "80" in t and "150" in t:
+        return "80–150k"
+    if "150" in t or "+" in t:
+        return "150k+"
+    return t
+
+
+def _normalize_deadline(text: str) -> str:
+    t = (text or "").strip().lower()
+    if "1–3" in t or "срочно" in t or "дня" in t:
+        return "срочно 1–3 дня"
+    if "1–2" in t or "нед" in t:
+        return "1–2 недели"
+    if "месяц" in t:
+        return "в течение месяца"
+    if "не гор" in t:
+        return "не горит"
+    return t
+
+
+def _normalize_contact(text: str) -> str:
+    t = (text or "").strip().lower()
+    if "тел" in t:
+        return "по телефону"
+    if "соз" in t:
+        return "созвон"
+    return "в Telegram"
+
+
+def _extract_phone(text: str) -> str | None:
+    if not text:
+        return None
+    m = re.search(r"(\+?\d[\d\s\-\(\)]{7,}\d)", text)
+    if not m:
+        return None
+    return re.sub(r"\s+", " ", m.group(1)).strip()
+
+
+def _lead_state_text(lead: LeadInfo | None) -> str:
+    if not lead:
+        return "-"
+    return json.dumps(
+        {
+            "step": lead.step,
+            "need": lead.need,
+            "budget": lead.budget,
+            "deadline": lead.deadline,
+            "contact_method": lead.contact_method,
+            "phone": lead.phone,
+            "call_time": lead.call_time,
+        },
+        ensure_ascii=False,
+    )
+
+
+async def _finalize_lead(
+    bot: Bot,
+    db: Database,
+    config: Config,
+    business_connection_id: str,
+    client_chat_id: int,
+) -> None:
+    lead = await db.get_lead(business_connection_id, client_chat_id)
+    await _send_business_message(
+        bot,
+        business_connection_id,
+        client_chat_id,
+        "Спасибо! ✅ Я передал данные менеджеру. Он свяжется с вами для уточнения деталей.",
+        reply_markup=remove_keyboard(),
+    )
+
+    admin_chat_id = await db.resolve_admin_chat_id(business_connection_id, config.admin_chat_id)
+    if admin_chat_id and lead:
+        await bot.send_message(
+            chat_id=admin_chat_id,
+            text=(
+                "✅ ЛИД СОБРАН\n"
+                f"chat_id={client_chat_id}\n"
+                f"Данные: {_lead_state_text(lead)}"
+            ),
+        )
