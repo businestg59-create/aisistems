@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: telegram-business-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.webapp:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: MODE
+        value: webhook
+      - key: WEBHOOK_BASE_URL
+        sync: false
+      - key: WEBHOOK_PATH
+        value: /tg/webhook
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4.1-mini
+      - key: OPENAI_EMBEDDING_MODEL
+        value: text-embedding-3-small
+      - key: KB_SITES
+        sync: false
