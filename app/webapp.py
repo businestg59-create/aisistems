@@ -17,7 +17,12 @@ logger = logging.getLogger(__name__)
 
 config = load_config()
 db = Database(config.database_url)
-bot = Bot(token=config.bot_token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
+
+bot = Bot(
+    token=config.bot_token,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+)
+
 dp = Dispatcher()
 dp.include_router(build_business_router(db, config))
 dp.include_router(build_admin_router(db))
@@ -54,22 +59,24 @@ async def on_shutdown() -> None:
     await db.close()
 
 
-@app.get("/")
+# Render / UptimeRobot могут дергать HEAD — поэтому делаем GET+HEAD
+@app.api_route("/", methods=["GET", "HEAD"])
 async def root() -> PlainTextResponse:
     return PlainTextResponse("OK")
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health() -> JSONResponse:
+    # быстрый endpoint: без OpenAI; только легкий ping БД (с таймаутом)
     db_ok = await db.ping(timeout_seconds=1.0)
-    return JSONResponse({"ok": db_ok})
+    return JSONResponse({"ok": bool(db_ok)})
 
 
-@app.get("/ready")
+@app.api_route("/ready", methods=["GET", "HEAD"])
 async def ready() -> JSONResponse:
     db_ok = await db.ping(timeout_seconds=1.0)
     status = 200 if db_ok else 503
-    return JSONResponse({"ok": db_ok}, status_code=status)
+    return JSONResponse({"ok": bool(db_ok)}, status_code=status)
 
 
 @app.post(config.webhook_path)
